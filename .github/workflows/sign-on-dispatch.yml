@@ -34,7 +34,7 @@ jobs:
           echo "Assets: $ASSETS_JSON"
 
           # Allowlist
-          ALLOWED=("iyulab/Filer-releases")
+          ALLOWED=("iyulab/Filer-releases" "iyulab/code-sign")
           MATCH=0
           for repo in "${ALLOWED[@]}"; do
             if [ "$repo" = "$CALLER" ]; then MATCH=1; break; fi
