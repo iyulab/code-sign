@@ -3,7 +3,7 @@ description: 'Authenticode-signs Windows PE files with the iyulab GlobalSign EV 
 
 inputs:
   files:
-    description: 'Newline-separated list of file paths to sign (relative to workspace or absolute).'
+    description: 'Newline-separated list of file paths or glob patterns to sign (relative to workspace or absolute). Glob patterns are expanded via PowerShell Resolve-Path.'
     required: true
   client-id:
     description: 'Azure AD app (service principal) client ID.'
@@ -59,19 +59,35 @@ runs:
         $token = az account get-access-token --resource https://vault.azure.net --query accessToken -o tsv
         if (-not $token) { throw "Failed to acquire Key Vault access token" }
 
-        # Parse newline-separated file list, skip blanks.
-        $files = $env:FILES_INPUT -split "`n" |
+        # Parse newline-separated list. Each line can be a literal path or a glob pattern.
+        $patterns = $env:FILES_INPUT -split "`n" |
           ForEach-Object { $_.Trim() } |
           Where-Object { $_ }
 
-        if ($files.Count -eq 0) {
+        if ($patterns.Count -eq 0) {
           throw "No files provided to sign"
         }
 
-        foreach ($file in $files) {
-          if (-not (Test-Path $file)) {
-            throw "File not found: $file"
+        # Expand patterns into concrete file paths via Resolve-Path.
+        # Deduplicate while preserving order.
+        $resolved = [System.Collections.Generic.List[string]]::new()
+        $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($pattern in $patterns) {
+          $matches = Resolve-Path -Path $pattern -ErrorAction SilentlyContinue
+          if (-not $matches) {
+            throw "No files matched pattern: $pattern"
           }
+          foreach ($m in $matches) {
+            $path = $m.ProviderPath
+            if ($seen.Add($path)) {
+              $resolved.Add($path) | Out-Null
+            }
+          }
+        }
+
+        Write-Host "Resolved $($resolved.Count) file(s) to sign from $($patterns.Count) pattern(s)."
+
+        foreach ($file in $resolved) {
           Write-Host "::group::Signing $file"
           AzureSignTool sign `
             --kvu $env:KVU `
@@ -86,4 +102,4 @@ runs:
           Write-Host "::endgroup::"
         }
 
-        Write-Host "Signed $($files.Count) file(s) successfully."
+        Write-Host "Signed $($resolved.Count) file(s) successfully."
