@@ -1,0 +1,89 @@
+name: 'Sign Windows Binaries (iyulab)'
+description: 'Authenticode-signs Windows PE files with the iyulab GlobalSign EV certificate via Azure Key Vault OIDC'
+
+inputs:
+  files:
+    description: 'Newline-separated list of file paths to sign (relative to workspace or absolute).'
+    required: true
+  client-id:
+    description: 'Azure AD app (service principal) client ID.'
+    required: false
+    default: '293d5452-469f-4988-93c9-0aee0f2d0846'
+  tenant-id:
+    description: 'Azure AD tenant ID.'
+    required: false
+    default: '66683f75-fa9e-4325-84e1-9253c1fc8cb7'
+  key-vault-url:
+    description: 'Azure Key Vault base URL.'
+    required: false
+    default: 'https://kv-codesign-iyulab.vault.azure.net/'
+  certificate-name:
+    description: 'Certificate name in the Key Vault.'
+    required: false
+    default: 'globalsign-ev-codesign'
+  timestamp-url:
+    description: 'RFC 3161 timestamp server URL.'
+    required: false
+    default: 'http://timestamp.globalsign.com/tsa/r6advanced1'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Azure login (OIDC)
+      uses: azure/login@v2
+      with:
+        client-id: ${{ inputs.client-id }}
+        tenant-id: ${{ inputs.tenant-id }}
+        allow-no-subscriptions: true
+
+    - name: Install AzureSignTool
+      shell: pwsh
+      run: |
+        if (-not (Get-Command AzureSignTool -ErrorAction SilentlyContinue)) {
+          dotnet tool install --global AzureSignTool
+        } else {
+          Write-Host "AzureSignTool already installed"
+        }
+
+    - name: Sign files
+      shell: pwsh
+      env:
+        KVU: ${{ inputs.key-vault-url }}
+        KVC: ${{ inputs.certificate-name }}
+        TR_URL: ${{ inputs.timestamp-url }}
+        FILES_INPUT: ${{ inputs.files }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+
+        # Acquire Key Vault access token via the logged-in service principal.
+        $token = az account get-access-token --resource https://vault.azure.net --query accessToken -o tsv
+        if (-not $token) { throw "Failed to acquire Key Vault access token" }
+
+        # Parse newline-separated file list, skip blanks.
+        $files = $env:FILES_INPUT -split "`n" |
+          ForEach-Object { $_.Trim() } |
+          Where-Object { $_ }
+
+        if ($files.Count -eq 0) {
+          throw "No files provided to sign"
+        }
+
+        foreach ($file in $files) {
+          if (-not (Test-Path $file)) {
+            throw "File not found: $file"
+          }
+          Write-Host "::group::Signing $file"
+          AzureSignTool sign `
+            --kvu $env:KVU `
+            --kva $token `
+            --kvc $env:KVC `
+            --tr $env:TR_URL `
+            --verbose `
+            $file
+          if ($LASTEXITCODE -ne 0) {
+            throw "AzureSignTool failed for $file with exit $LASTEXITCODE"
+          }
+          Write-Host "::endgroup::"
+        }
+
+        Write-Host "Signed $($files.Count) file(s) successfully."

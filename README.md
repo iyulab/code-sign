@@ -2,24 +2,53 @@
 
 Centralized Authenticode signing service for iyulab Windows artifacts.
 
-This repository hosts a single GitHub Actions workflow that:
-1. Receives `repository_dispatch` events from caller repos
-2. Authenticates to Azure Key Vault via OIDC (federated credential)
-3. Downloads the unsigned artifact from the caller's draft GitHub Release
-4. Signs it with AzureSignTool using a GlobalSign EV code signing certificate
-5. Replaces the asset on the caller's release and uploads a `<asset>.signed` marker
+This repository provides **two ways** to sign Windows binaries with the iyulab GlobalSign EV code signing certificate:
 
-The Azure Key Vault credentials never leave this repository. Caller repos do not need their own Azure AD configuration.
+### 1. Composite Action (`iyulab/code-sign@main`) — Recommended for mid-build signing
+
+Call the composite action directly from any iyulab repo's workflow. Signs files in place on the caller's runner:
+
+```yaml
+jobs:
+  build:
+    runs-on: windows-latest
+    environment: production   # Required for OIDC federated credential subject match
+    permissions:
+      id-token: write         # Required for OIDC
+      contents: read
+    steps:
+      - run: dotnet publish ... -o out
+      - uses: iyulab/code-sign@main
+        with:
+          files: |
+            out/MyApp.exe
+            out/MyApp.dll
+```
+
+**Prerequisites for this path:**
+- Caller repo must be granted an Azure AD federated credential with subject `repo:iyulab/<caller>:environment:production`
+- Caller repo must have a `production` environment
+- `id-token: write` permission on the calling job
+- The `production` environment must be declared on the job
+
+### 2. Dispatch Service (`sign-on-dispatch.yml`) — For batch post-build signing
+
+Send a `repository_dispatch` event with asset names already attached to a draft GitHub Release. The service downloads, signs, and replaces the assets. Useful when the caller doesn't want to modify its build jobs (only its publish step).
+
+The Azure Key Vault credentials never leave this repository. Caller repos do not need their own Azure AD configuration for path (2).
 
 ---
 
 ## Trust model
 
-- **Azure AD federated credential** subject: `repo:iyulab/code-sign:environment:production`
-  - Only this repo's `production` environment can mint OIDC tokens for the Key Vault service principal
-- **Caller authorization**: explicit allowlist in `.github/workflows/sign-on-dispatch.yml`
-- **Cross-repo asset access**: iyulab org-level `RELEASE_TOKEN` secret (shared across iyulab release pipelines)
-- **Payload validation**: tag format, asset name whitelist, path traversal prevention
+- **Azure AD federated credentials** (one per caller repo):
+  - `repo:iyulab/code-sign:environment:production` — for the dispatch service path
+  - `repo:iyulab/Filer-releases:environment:production` — for the composite action path
+  - Additional credentials added per caller repo as needed
+- Every federated credential requires the caller to declare `environment: production` on the signing job — this is the OIDC claim gate
+- **Composite action path**: no secrets needed on caller side, only the federated credential
+- **Dispatch service path**: explicit allowlist in `.github/workflows/sign-on-dispatch.yml` + iyulab org-level `RELEASE_TOKEN` for cross-repo asset access
+- **Payload validation** (dispatch path only): tag format, asset name whitelist, path traversal prevention
 
 ---
 
@@ -135,7 +164,7 @@ And the polling loop in `wait-for-signed`:
 - `.dll` — Native and managed DLLs
 - `.msi` — Windows Installer packages
 
-For artifacts nested inside zip files, see the Phase 2 plan (not yet implemented). Current workaround: sign executables before packaging them into zips.
+For artifacts nested inside zip files, use the **composite action** path to sign binaries in place on the build runner BEFORE packaging. The dispatch service path only operates on top-level release assets.
 
 ---
 
@@ -177,7 +206,8 @@ Inspect the most recent `sign-on-dispatch.yml` run in this repo for the actual e
 
 | File | Purpose |
 |---|---|
-| `.github/workflows/sign-on-dispatch.yml` | Production service workflow (repository_dispatch handler) |
+| `action.yml` | **Composite action** for in-build signing (`uses: iyulab/code-sign@main`) |
+| `.github/workflows/sign-on-dispatch.yml` | Dispatch service workflow (repository_dispatch handler) |
 | `.github/workflows/_sign-test.yml` | Standalone signing smoke test (workflow_dispatch) |
 | `.github/workflows/_self-test.yml` | E2E self-test of the dispatch handler (workflow_dispatch) |
 
