@@ -1,0 +1,8 @@
+work/
+*.log
+*.exe
+*.dll
+*.signed
+.vs/
+bin/
+obj/
