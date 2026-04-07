@@ -1,0 +1,99 @@
+name: _Self Test (E2E)
+
+# Stage 2: end-to-end test of the dispatch handler using code-sign as both
+# caller and signer. Builds a dummy exe, creates a draft release in this repo,
+# dispatches a sign-request, polls for the .signed marker, then verifies the
+# signed binary downloaded from the release.
+#
+# REQUIRES: iyulab/code-sign temporarily in the allowlist of sign-on-dispatch.yml.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  fake-caller:
+    runs-on: windows-latest
+    steps:
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build dummy exe
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path work -Force | Out-Null
+          Set-Location work
+          dotnet new console -n DummyApp --force
+          dotnet publish DummyApp/DummyApp.csproj -c Release -r win-x64 --self-contained false -o out
+
+      - name: Compute test tag
+        id: tag
+        shell: bash
+        run: echo "tag=v0.0.0-selftest$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Create draft release with unsigned dummy
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        shell: bash
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --title "Self-test $TAG" --notes "self-test"
+          gh release upload "$TAG" work/out/DummyApp.exe --repo "$GITHUB_REPOSITORY"
+
+      - name: Dispatch sign-request to self
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        shell: bash
+        run: |
+          gh api repos/$GITHUB_REPOSITORY/dispatches \
+            -X POST \
+            -F event_type=sign-request \
+            -F "client_payload[caller_repo]=$GITHUB_REPOSITORY" \
+            -F "client_payload[release_tag]=$TAG" \
+            -F "client_payload[assets][]=DummyApp.exe" \
+            -F "client_payload[request_id]=selftest-${{ github.run_id }}"
+
+      - name: Poll for signed marker
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        shell: bash
+        run: |
+          for i in $(seq 1 40); do
+            if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+               | jq -e '.assets[] | select(.name == "DummyApp.exe.signed")' > /dev/null; then
+              echo "Marker detected after ${i} attempts"
+              exit 0
+            fi
+            echo "Attempt $i: marker not yet present"
+            sleep 15
+          done
+          echo "::error::Timeout waiting for signature marker"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets
+          exit 1
+
+      - name: Download signed exe and verify
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path verify -Force | Out-Null
+          gh release download $env:TAG --repo $env:GITHUB_REPOSITORY --pattern DummyApp.exe --dir verify --clobber
+          $sig = Get-AuthenticodeSignature verify/DummyApp.exe
+          $sig | Format-List *
+          if ($sig.Status -ne 'Valid') { throw "Signature invalid: $($sig.Status)" }
+
+      - name: Cleanup test release
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        shell: bash
+        run: |
+          gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
