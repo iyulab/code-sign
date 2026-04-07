@@ -113,10 +113,15 @@ jobs:
             gh release delete-asset $env:TAG $asset --repo $env:CALLER --yes
             gh release upload $env:TAG $local --repo $env:CALLER
 
-            # Upload completion marker
+            # Upload completion marker (must be non-empty: GitHub rejects 0-byte uploads)
             $markerName = "$asset.signed"
             $markerPath = Join-Path 'work' $markerName
-            New-Item -ItemType File -Path $markerPath -Force | Out-Null
+            $markerBody = @{
+              asset = $asset
+              signedAt = (Get-Date -Format 'o')
+              requestId = "${{ github.event.client_payload.request_id }}"
+            } | ConvertTo-Json -Compress
+            Set-Content -Path $markerPath -Value $markerBody -NoNewline
             # Marker may already exist on retry — clobber via delete
             gh release delete-asset $env:TAG $markerName --repo $env:CALLER --yes 2>$null
             gh release upload $env:TAG $markerPath --repo $env:CALLER
