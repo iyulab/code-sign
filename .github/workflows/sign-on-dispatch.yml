@@ -34,7 +34,7 @@ jobs:
           echo "Assets: $ASSETS_JSON"
 
           # Allowlist
-          ALLOWED=("iyulab/Filer-releases")
+          ALLOWED=("iyulab/Filer-releases" "iyulab/forge-releases")
           MATCH=0
           for repo in "${ALLOWED[@]}"; do
             if [ "$repo" = "$CALLER" ]; then MATCH=1; break; fi
@@ -44,8 +44,15 @@ jobs:
             exit 1
           fi
 
-          # Tag format
-          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+          # Tag format. Accepts:
+          #   v1.2.3
+          #   v1.2.3-prerelease
+          #   {channel}-v1.2.3        (e.g. lens-v0.7.3, 8d-v0.3.5, sop-v0.4.1)
+          #   {channel}-v1.2.3-prerelease
+          # Channel prefix is optional and lowercase alphanumerics + hyphens
+          # to disambiguate sibling apps sharing one releases repo (e.g.
+          # iyulab/forge-releases hosts lens/spc/fmea/8d/sop/doe).
+          if ! [[ "$TAG" =~ ^([a-z0-9]+-)?v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
             echo "::error::Invalid tag format: $TAG"
             exit 1
           fi
