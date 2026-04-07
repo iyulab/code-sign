@@ -56,8 +56,10 @@ jobs:
             exit 1
           fi
 
-          # Asset names
-          echo "$ASSETS_JSON" | jq -r '.[]' | while read -r asset; do
+          # Asset names — mapfile avoids subshell pipe exit-code issues,
+          # tr strips CR that Windows jq.exe may emit.
+          mapfile -t ASSETS < <(echo "$ASSETS_JSON" | jq -r '.[]' | tr -d '\r')
+          for asset in "${ASSETS[@]}"; do
             if ! [[ "$asset" =~ ^[A-Za-z0-9._-]+\.(exe|dll|msi)$ ]]; then
               echo "::error::Invalid asset name: $asset"
               exit 1
