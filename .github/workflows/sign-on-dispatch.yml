@@ -1,0 +1,123 @@
+name: Sign on Dispatch
+
+# Production signing service.
+# Triggered by repository_dispatch events from caller repos.
+# See README.md for the dispatch payload contract and onboarding instructions.
+
+on:
+  repository_dispatch:
+    types: [sign-request]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  sign:
+    runs-on: windows-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Validate payload
+        shell: bash
+        env:
+          CALLER: ${{ github.event.client_payload.caller_repo }}
+          TAG: ${{ github.event.client_payload.release_tag }}
+          ASSETS_JSON: ${{ toJSON(github.event.client_payload.assets) }}
+          REQ_ID: ${{ github.event.client_payload.request_id }}
+        run: |
+          set -euo pipefail
+
+          echo "Request ID: $REQ_ID"
+          echo "Caller: $CALLER"
+          echo "Tag: $TAG"
+          echo "Assets: $ASSETS_JSON"
+
+          # Allowlist
+          ALLOWED=("iyulab/Filer-releases")
+          MATCH=0
+          for repo in "${ALLOWED[@]}"; do
+            if [ "$repo" = "$CALLER" ]; then MATCH=1; break; fi
+          done
+          if [ "$MATCH" -ne 1 ]; then
+            echo "::error::Caller '$CALLER' not in allowlist"
+            exit 1
+          fi
+
+          # Tag format
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+            echo "::error::Invalid tag format: $TAG"
+            exit 1
+          fi
+
+          # Request ID format
+          if ! [[ "$REQ_ID" =~ ^[A-Za-z0-9_-]{1,64}$ ]]; then
+            echo "::error::Invalid request_id: $REQ_ID"
+            exit 1
+          fi
+
+          # Asset names
+          echo "$ASSETS_JSON" | jq -r '.[]' | while read -r asset; do
+            if ! [[ "$asset" =~ ^[A-Za-z0-9._-]+\.(exe|dll|msi)$ ]]; then
+              echo "::error::Invalid asset name: $asset"
+              exit 1
+            fi
+          done
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Install AzureSignTool
+        run: dotnet tool install --global AzureSignTool
+
+      - name: Sign assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          CALLER: ${{ github.event.client_payload.caller_repo }}
+          TAG: ${{ github.event.client_payload.release_tag }}
+          ASSETS_JSON: ${{ toJSON(github.event.client_payload.assets) }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $token = az account get-access-token --resource https://vault.azure.net --query accessToken -o tsv
+          $assets = $env:ASSETS_JSON | ConvertFrom-Json
+
+          New-Item -ItemType Directory -Path work -Force | Out-Null
+
+          foreach ($asset in $assets) {
+            Write-Host "::group::Signing $asset"
+
+            # Download from caller release
+            gh release download $env:TAG --repo $env:CALLER --pattern $asset --dir work --clobber
+            $local = Join-Path 'work' $asset
+            if (-not (Test-Path $local)) {
+              throw "Download failed: $local not present"
+            }
+
+            # Sign in place
+            AzureSignTool sign `
+              --kvu "https://kv-codesign-iyulab.vault.azure.net/" `
+              --kva $token `
+              --kvc "globalsign-ev-codesign" `
+              --tr "http://timestamp.globalsign.com/tsa/r6advanced1" `
+              --verbose `
+              $local
+
+            # Replace asset on caller release (delete then upload)
+            gh release delete-asset $env:TAG $asset --repo $env:CALLER --yes
+            gh release upload $env:TAG $local --repo $env:CALLER
+
+            # Upload completion marker
+            $markerName = "$asset.signed"
+            $markerPath = Join-Path 'work' $markerName
+            New-Item -ItemType File -Path $markerPath -Force | Out-Null
+            # Marker may already exist on retry — clobber via delete
+            gh release delete-asset $env:TAG $markerName --repo $env:CALLER --yes 2>$null
+            gh release upload $env:TAG $markerPath --repo $env:CALLER
+
+            Write-Host "::endgroup::"
+          }
