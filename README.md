@@ -26,10 +26,53 @@ jobs:
 ```
 
 **Prerequisites for this path:**
-- Caller repo must be granted an Azure AD federated credential with subject `repo:iyulab/<caller>:environment:production`
+- Caller repo must be granted an Azure AD federated credential whose subject matches the caller's OIDC `sub` claim for the `production` environment — `repo:iyulab/<caller>:environment:production`, or for repositories that use immutable subject claims `repo:iyulab@<org-id>/<caller>@<repo-id>:environment:production`. Check which form a repo emits with `gh api repos/iyulab/<caller>/actions/oidc/customization/sub` before creating the credential.
 - Caller repo must have a `production` environment
 - `id-token: write` permission on the calling job
 - The `production` environment must be declared on the job
+
+**Action inputs:**
+
+| Input | Default | Purpose |
+|---|---|---|
+| `files` | *(empty)* | Newline-separated paths or glob patterns to sign. Empty = only prepare the job (see below). |
+| `description` | *(empty)* | Description shown in the signature, e.g. the product name |
+| `description-url` | *(empty)* | URL shown in the signature |
+| `client-id`, `tenant-id`, `key-vault-url`, `certificate-name`, `timestamp-url` | iyulab values | Signing identity — leave at the defaults |
+
+### Signing from a build tool's sign hook
+
+Some files only exist halfway through a build step — an installer bundler signs the app, its uninstaller and the installer itself as it creates them, running a sign command once per file. The action covers this too: besides signing `files`, it always prepares the rest of the job so that any later step can sign a single file with the same certificate:
+
+- `code-sign-file.cmd <file>` — signs one file; its folder is put on `PATH` (also exported as `CODE_SIGN_FILE`, the absolute path, and as the action output `sign-command`)
+- `CODE_SIGN_LOG` — a log file each call appends to: `== <file>: signed` or `== <file>: FAILED: <reason>`, followed by the AzureSignTool output (also the action output `log`)
+
+Run the action before the build step — with `files` for anything that must be signed before bundling, or with no `files` to only prepare. Example with Tauri, whose `bundle.windows.signCommand` is run for every file the bundler signs:
+
+```yaml
+    steps:
+      # ... build the app and any sidecar binaries ...
+      - uses: iyulab/code-sign@<sha>
+        with:
+          files: src-host/publish/MyApp.Host.exe   # bundled as a resource: the bundler does not sign it
+          description: MyApp
+      - run: npx tauri build --config src-tauri/tauri.sign.conf.json
+      - name: Show sign log
+        if: failure()
+        shell: pwsh
+        run: if (Test-Path $env:CODE_SIGN_LOG) { Get-Content $env:CODE_SIGN_LOG }
+```
+
+with `src-tauri/tauri.sign.conf.json`:
+
+```json
+{ "bundle": { "windows": { "signCommand": "code-sign-file.cmd %1" } } }
+```
+
+Notes:
+- A sign hook usually keeps a failing command's output to itself, and some do not fail the build at all (an NSIS uninstaller is signed by `makensis`, which ignores the command's exit code). Always verify the signatures of what you ship, e.g. `Get-AuthenticodeSignature` on the installed files, and print `CODE_SIGN_LOG` when a step fails.
+- The Key Vault token is taken from `az` for every file, so signing works in any later step of the job as long as the Azure CLI session from the action's login is still valid. That session cannot be renewed once its access token expires (roughly an hour after the action runs), so run the action shortly before the steps that sign, not at the start of a long job.
+- Calling the action again in the same job is fine: the settings are exported again and the log keeps growing.
 
 ### 2. Dispatch Service (`sign-on-dispatch.yml`) — For batch post-build signing
 
@@ -183,7 +226,13 @@ Asset names must be alphanumeric + `._-` with extension `.exe`, `.dll`, or `.msi
 The asset does not exist on the caller's release at the time of dispatch. Confirm the caller's `draft-release` job completed before `request-sign` runs.
 
 ### `AADSTS70021` / OIDC token rejected
-Federated credential subject mismatch. Verify the credential in Azure AD has subject `repo:iyulab/code-sign:environment:production` and that the workflow job declares `environment: production`.
+Federated credential subject mismatch. Verify the credential's subject matches what the caller's job emits (`gh api repos/iyulab/<repo>/actions/oidc/customization/sub` tells whether the repo uses the `repo:iyulab/<repo>:...` or the immutable `repo:iyulab@<org-id>/<repo>@<repo-id>:...` form) and that the workflow job declares `environment: production`.
+
+### `sign-file.ps1: CODE_SIGN_... is not set` / `code-sign-file.cmd` not recognized
+The step that signs runs before the action, or in a different job. Run `iyulab/code-sign` earlier in the same job; its settings and `PATH` entry only reach later steps of that job.
+
+### `sign-file.ps1: no Key Vault access token`
+The Azure CLI session from the action's login is gone or expired. Run the action closer to the step that signs (see the notes under "Signing from a build tool's sign hook").
 
 ### `Forbidden` from Key Vault
 The Azure AD service principal lacks `Key Vault Certificate User` role on `kv-codesign-iyulab`.
@@ -207,6 +256,7 @@ Inspect the most recent `sign-on-dispatch.yml` run in this repo for the actual e
 | File | Purpose |
 |---|---|
 | `action.yml` | **Composite action** for in-build signing (`uses: iyulab/code-sign@main`) |
+| `scripts/sign-file.ps1` | Signs one file; used by the action for each of its `files` and by `code-sign-file.cmd` |
 | `.github/workflows/sign-on-dispatch.yml` | Dispatch service workflow (repository_dispatch handler) |
 | `.github/workflows/_sign-test.yml` | Standalone signing smoke test (workflow_dispatch) |
 | `.github/workflows/_self-test.yml` | E2E self-test of the dispatch handler (workflow_dispatch) |

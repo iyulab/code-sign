@@ -1,10 +1,11 @@
 name: 'Sign Windows Binaries (iyulab)'
-description: 'Authenticode-signs Windows PE files with the iyulab GlobalSign EV certificate via Azure Key Vault OIDC'
+description: 'Authenticode-signs Windows PE files with the iyulab GlobalSign EV certificate via Azure Key Vault OIDC, and prepares the job so later steps can sign more files one at a time'
 
 inputs:
   files:
-    description: 'Newline-separated list of file paths or glob patterns to sign (relative to workspace or absolute). Glob patterns are expanded via PowerShell Resolve-Path.'
-    required: true
+    description: 'Newline-separated list of file paths or glob patterns to sign (relative to workspace or absolute). Glob patterns are expanded via PowerShell Resolve-Path. Leave empty to only prepare the job for later signing (see README).'
+    required: false
+    default: ''
   client-id:
     description: 'Azure AD app (service principal) client ID.'
     required: false
@@ -25,6 +26,22 @@ inputs:
     description: 'RFC 3161 timestamp server URL.'
     required: false
     default: 'http://timestamp.globalsign.com/tsa/r6advanced1'
+  description:
+    description: 'Description shown in the signature (AzureSignTool --description), e.g. the product name.'
+    required: false
+    default: ''
+  description-url:
+    description: 'URL shown in the signature (AzureSignTool --description-url).'
+    required: false
+    default: ''
+
+outputs:
+  sign-command:
+    description: 'Absolute path of code-sign-file.cmd, which signs the one file given as its argument. Also exported as CODE_SIGN_FILE, and its folder is put on PATH.'
+    value: ${{ steps.prepare.outputs.sign-command }}
+  log:
+    description: 'Absolute path of the log every signed file is appended to (also exported as CODE_SIGN_LOG).'
+    value: ${{ steps.prepare.outputs.log }}
 
 runs:
   using: 'composite'
@@ -45,40 +62,71 @@ runs:
           Write-Host "AzureSignTool already installed"
         }
 
-    - name: Sign files
+    # Everything scripts/sign-file.ps1 needs, exported for the rest of the job, so a build tool's sign
+    # hook (which runs in a later step) can sign files one at a time with the same settings.
+    - name: Prepare signing
+      id: prepare
       shell: pwsh
       env:
+        ACTION_PATH: ${{ github.action_path }}
         KVU: ${{ inputs.key-vault-url }}
         KVC: ${{ inputs.certificate-name }}
         TR_URL: ${{ inputs.timestamp-url }}
+        DESCRIPTION: ${{ inputs.description }}
+        DESCRIPTION_URL: ${{ inputs.description-url }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+
+        $dir = Join-Path $env:RUNNER_TEMP 'code-sign'
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        $script = Join-Path $env:ACTION_PATH 'scripts/sign-file.ps1'
+        $log = Join-Path $dir 'sign.log'
+
+        # A command a sign hook can name without knowing where this action lives. The script's path is
+        # written into it: a batch file found through PATH cannot rely on %~dp0 for its own folder.
+        $command = Join-Path $dir 'code-sign-file.cmd'
+        Set-Content -LiteralPath $command -Value "@pwsh -NoProfile -ExecutionPolicy Bypass -File `"$script`" %*"
+        Add-Content -LiteralPath $env:GITHUB_PATH -Value $dir
+
+        Add-Content -LiteralPath $env:GITHUB_ENV -Value @(
+          "CODE_SIGN_KEY_VAULT_URL=$env:KVU"
+          "CODE_SIGN_CERTIFICATE=$env:KVC"
+          "CODE_SIGN_TIMESTAMP_URL=$env:TR_URL"
+          "CODE_SIGN_DESCRIPTION=$env:DESCRIPTION"
+          "CODE_SIGN_DESCRIPTION_URL=$env:DESCRIPTION_URL"
+          "CODE_SIGN_LOG=$log"
+          "CODE_SIGN_FILE=$command"
+        )
+        Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value @(
+          "sign-command=$command"
+          "log=$log"
+        )
+
+    - name: Sign files
+      if: inputs.files != ''
+      shell: pwsh
+      env:
+        ACTION_PATH: ${{ github.action_path }}
         FILES_INPUT: ${{ inputs.files }}
       run: |
         $ErrorActionPreference = 'Stop'
 
-        # Acquire Key Vault access token via the logged-in service principal.
-        $token = az account get-access-token --resource https://vault.azure.net --query accessToken -o tsv
-        if (-not $token) { throw "Failed to acquire Key Vault access token" }
-
         # Parse newline-separated list. Each line can be a literal path or a glob pattern.
-        $patterns = $env:FILES_INPUT -split "`n" |
+        $patterns = @($env:FILES_INPUT -split "`n" |
           ForEach-Object { $_.Trim() } |
-          Where-Object { $_ }
-
-        if ($patterns.Count -eq 0) {
-          throw "No files provided to sign"
-        }
+          Where-Object { $_ })
 
         # Expand patterns into concrete file paths via Resolve-Path.
         # Deduplicate while preserving order.
         $resolved = [System.Collections.Generic.List[string]]::new()
         $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         foreach ($pattern in $patterns) {
-          $matches = Resolve-Path -Path $pattern -ErrorAction SilentlyContinue
-          if (-not $matches) {
+          $found = Resolve-Path -Path $pattern -ErrorAction SilentlyContinue
+          if (-not $found) {
             throw "No files matched pattern: $pattern"
           }
-          foreach ($m in $matches) {
-            $path = $m.ProviderPath
+          foreach ($match in $found) {
+            $path = $match.ProviderPath
             if ($seen.Add($path)) {
               $resolved.Add($path) | Out-Null
             }
@@ -87,18 +135,10 @@ runs:
 
         Write-Host "Resolved $($resolved.Count) file(s) to sign from $($patterns.Count) pattern(s)."
 
+        $signFile = Join-Path $env:ACTION_PATH 'scripts/sign-file.ps1'
         foreach ($file in $resolved) {
           Write-Host "::group::Signing $file"
-          AzureSignTool sign `
-            --kvu $env:KVU `
-            --kva $token `
-            --kvc $env:KVC `
-            --tr $env:TR_URL `
-            --verbose `
-            $file
-          if ($LASTEXITCODE -ne 0) {
-            throw "AzureSignTool failed for $file with exit $LASTEXITCODE"
-          }
+          & $signFile $file
           Write-Host "::endgroup::"
         }
 

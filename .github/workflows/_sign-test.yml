@@ -1,8 +1,9 @@
 name: _Sign Test (standalone)
 
-# Stage 1 smoke test: builds a tiny .NET hello-world exe, signs it,
-# and verifies the signature. Validates that the OIDC + Key Vault path works
-# in isolation, before any dispatch handler is built.
+# Smoke test of the composite action in this repository: builds a tiny .NET hello-world, signs its DLL
+# through the action's `files` input and its exe the way a build tool's sign hook would (by running
+# code-sign-file.cmd in a later step), then verifies both signatures. Validates the OIDC + Key Vault path
+# and the per-file entry point in isolation.
 
 on:
   workflow_dispatch:
@@ -15,9 +16,12 @@ jobs:
   sign:
     runs-on: windows-latest
     environment: production
+    timeout-minutes: 15
     steps:
+      - uses: actions/checkout@v7
+
       - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: '8.0.x'
 
@@ -30,29 +34,23 @@ jobs:
           dotnet publish DummyApp/DummyApp.csproj -c Release -r win-x64 --self-contained false -o out
           Get-ChildItem out
 
-      - name: Azure login (OIDC)
-        uses: azure/login@v2
+      - name: Sign DLL (files input)
+        uses: ./
         with:
-          client-id: ${{ vars.AZURE_CLIENT_ID }}
-          tenant-id: ${{ vars.AZURE_TENANT_ID }}
-          allow-no-subscriptions: true
+          files: work/out/DummyApp.dll
+          description: DummyApp
 
-      - name: Install AzureSignTool
-        run: dotnet tool install --global AzureSignTool
+      # A sign hook runs a plain command line in a later step: the command must be on PATH.
+      - name: Sign exe (per-file command)
+        shell: cmd
+        run: code-sign-file.cmd "%GITHUB_WORKSPACE%\work\out\DummyApp.exe"
 
-      - name: Sign dummy exe
+      - name: Show sign log
+        if: always()
         shell: pwsh
-        run: |
-          $token = az account get-access-token --resource https://vault.azure.net --query accessToken -o tsv
-          AzureSignTool sign `
-            --kvu "https://kv-codesign-iyulab.vault.azure.net/" `
-            --kva $token `
-            --kvc "globalsign-ev-codesign" `
-            --tr "http://timestamp.globalsign.com/tsa/r6advanced1" `
-            --verbose `
-            "work/out/DummyApp.exe"
+        run: if (Test-Path $env:CODE_SIGN_LOG) { Get-Content $env:CODE_SIGN_LOG } else { 'nothing was signed' }
 
-      - name: Verify signature (signtool)
+      - name: Verify signatures (signtool)
         shell: pwsh
         run: |
           $sdkRoot = "C:\Program Files (x86)\Windows Kits\10\bin"
@@ -60,20 +58,29 @@ jobs:
             Where-Object { $_.FullName -match 'x64' } |
             Select-Object -First 1
           if (-not $signtool) { throw "signtool.exe not found" }
-          & $signtool.FullName verify /pa /v "work/out/DummyApp.exe"
-
-      - name: Verify signature (PowerShell)
-        shell: pwsh
-        run: |
-          $sig = Get-AuthenticodeSignature "work/out/DummyApp.exe"
-          $sig | Format-List *
-          if ($sig.Status -ne 'Valid') {
-            throw "Signature status: $($sig.Status)"
+          foreach ($file in 'work/out/DummyApp.dll', 'work/out/DummyApp.exe') {
+            & $signtool.FullName verify /pa /v $file
+            if ($LASTEXITCODE -ne 0) { throw "signtool verify failed for $file" }
           }
 
-      - name: Upload signed exe (for inspection)
-        uses: actions/upload-artifact@v4
+      - name: Verify signatures (PowerShell)
+        shell: pwsh
+        run: |
+          foreach ($file in 'work/out/DummyApp.dll', 'work/out/DummyApp.exe') {
+            $sig = Get-AuthenticodeSignature $file
+            $sig | Format-List *
+            if ($sig.Status -ne 'Valid') {
+              throw "Signature status of ${file}: $($sig.Status)"
+            }
+          }
+          $logged = @(Select-String -LiteralPath $env:CODE_SIGN_LOG -Pattern ': signed$')
+          if ($logged.Count -ne 2) { throw "expected 2 signed entries in the sign log, found $($logged.Count)" }
+
+      - name: Upload signed files (for inspection)
+        uses: actions/upload-artifact@v7
         with:
           name: signed-dummy
-          path: work/out/DummyApp.exe
+          path: |
+            work/out/DummyApp.exe
+            work/out/DummyApp.dll
           retention-days: 1
