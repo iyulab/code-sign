@@ -46,21 +46,32 @@ outputs:
 runs:
   using: 'composite'
   steps:
+    # Everything that runs here holds the job's OIDC token, so every piece of third-party code is pinned:
+    # the login action to a commit (its tag in the trailing comment), AzureSignTool to an exact version.
+    # Bump them deliberately.
     - name: Azure login (OIDC)
-      uses: azure/login@v3
+      uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
       with:
         client-id: ${{ inputs.client-id }}
         tenant-id: ${{ inputs.tenant-id }}
         allow-no-subscriptions: true
 
+    # Installed into a folder of this job rather than globally, so a copy already on the runner (any
+    # version) is never the one that runs.
     - name: Install AzureSignTool
+      id: tool
       shell: pwsh
+      env:
+        AZURE_SIGN_TOOL_VERSION: '7.0.1'
       run: |
-        if (-not (Get-Command AzureSignTool -ErrorAction SilentlyContinue)) {
-          dotnet tool install --global AzureSignTool
-        } else {
-          Write-Host "AzureSignTool already installed"
+        $ErrorActionPreference = 'Stop'
+        $dir = Join-Path $env:RUNNER_TEMP 'code-sign/tool'
+        $exe = Join-Path $dir ($IsWindows ? 'AzureSignTool.exe' : 'AzureSignTool')
+        if (-not (Test-Path -LiteralPath $exe)) {
+          dotnet tool install AzureSignTool --version $env:AZURE_SIGN_TOOL_VERSION --tool-path $dir
+          if ($LASTEXITCODE -ne 0) { throw "dotnet tool install failed with exit code $LASTEXITCODE" }
         }
+        Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "path=$exe"
 
     # Everything scripts/sign-file.ps1 needs, exported for the rest of the job, so a build tool's sign
     # hook (which runs in a later step) can sign files one at a time with the same settings.
@@ -69,6 +80,7 @@ runs:
       shell: pwsh
       env:
         ACTION_PATH: ${{ github.action_path }}
+        TOOL: ${{ steps.tool.outputs.path }}
         KVU: ${{ inputs.key-vault-url }}
         KVC: ${{ inputs.certificate-name }}
         TR_URL: ${{ inputs.timestamp-url }}
@@ -89,6 +101,7 @@ runs:
         Add-Content -LiteralPath $env:GITHUB_PATH -Value $dir
 
         Add-Content -LiteralPath $env:GITHUB_ENV -Value @(
+          "CODE_SIGN_TOOL=$env:TOOL"
           "CODE_SIGN_KEY_VAULT_URL=$env:KVU"
           "CODE_SIGN_CERTIFICATE=$env:KVC"
           "CODE_SIGN_TIMESTAMP_URL=$env:TR_URL"

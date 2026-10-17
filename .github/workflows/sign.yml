@@ -1,0 +1,122 @@
+name: Sign (reusable)
+
+# Layer 2: a signing job that runs nothing but signing. A caller builds without any credential, uploads the
+# files to sign as an artifact, and calls this workflow. The job here downloads that artifact, refuses it
+# unless it holds exactly the listed files, signs them with this repository's action, verifies the
+# signatures and uploads the signed copies as a new artifact. Nothing of the caller's runs in this job.
+#
+#   jobs:
+#     sign:
+#       needs: build
+#       uses: iyulab/code-sign/.github/workflows/sign.yml@<sha> # <tag>
+#       permissions:
+#         id-token: write
+#         contents: read
+#       with:
+#         artifact: unsigned-binaries
+#         files: |
+#           MyApp.exe
+#           runtime/MyApp.Host.exe
+#         signed-artifact: signed-binaries
+#
+# The action comes from the same commit as this file (job.workflow_sha), so pinning this workflow pins the
+# action too. Every third-party action is pinned to a commit; the tag is in the trailing comment.
+
+on:
+  workflow_call:
+    inputs:
+      artifact:
+        description: Name of the artifact (from the calling run) that holds the files to sign.
+        required: true
+        type: string
+      files:
+        description: Newline-separated paths relative to the artifact root. The artifact must hold exactly these files — no more, no fewer.
+        required: true
+        type: string
+      signed-artifact:
+        description: Name of the artifact the signed files are uploaded as (same layout as the input).
+        required: true
+        type: string
+      description:
+        description: Description shown in the signature, e.g. the product name.
+        required: false
+        type: string
+        default: ''
+      description-url:
+        description: URL shown in the signature.
+        required: false
+        type: string
+        default: ''
+      retention-days:
+        description: Days the signed artifact is kept. A later job of the same run usually consumes it right away.
+        required: false
+        type: number
+        default: 1
+
+permissions: {}
+
+jobs:
+  sign:
+    runs-on: windows-latest        # Authenticode signing and its verification run on Windows
+    timeout-minutes: 20
+    environment: production        # the OIDC federated credential requires this environment
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Check out the signing action at this workflow's commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .code-sign
+          persist-credentials: false
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ inputs.artifact }}
+          path: bin
+
+      - id: files
+        name: Accept exactly the listed files
+        shell: pwsh
+        env:
+          FILES_INPUT: ${{ inputs.files }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = (Resolve-Path bin).Path
+          $expected = @($env:FILES_INPUT -split "`n" | ForEach-Object { $_.Trim().Replace('\', '/') } | Where-Object { $_ })
+          if (-not $expected) { throw 'files is empty' }
+          foreach ($name in $expected) {
+            if ($name.StartsWith('/') -or $name -match '(^|/)\.\.(/|$)' -or $name -match '^[A-Za-z]:') { throw "Not a path inside the artifact: $name" }
+          }
+          $expected = @($expected | Sort-Object -Unique)
+          $present = @(Get-ChildItem $root -Recurse -File | ForEach-Object { [IO.Path]::GetRelativePath($root, $_.FullName).Replace('\', '/') } | Sort-Object)
+          $diff = Compare-Object $expected $present
+          if ($diff) { throw "The artifact does not hold exactly the listed files:`n$($diff | Out-String)" }
+          "files<<EOF" >> $env:GITHUB_OUTPUT
+          $expected | ForEach-Object { Join-Path $root $_ } >> $env:GITHUB_OUTPUT
+          "EOF" >> $env:GITHUB_OUTPUT
+
+      - uses: ./.code-sign
+        with:
+          files: ${{ steps.files.outputs.files }}
+          description: ${{ inputs.description }}
+          description-url: ${{ inputs.description-url }}
+
+      - name: Verify signatures
+        shell: pwsh
+        env:
+          FILES: ${{ steps.files.outputs.files }}
+        run: |
+          $files = @($env:FILES -split "`n" | ForEach-Object Trim | Where-Object { $_ })
+          $bad = $files | Where-Object { (Get-AuthenticodeSignature $_).Status -ne 'Valid' }
+          if ($bad) { throw "Missing or invalid signature: $($bad -join ', ')" }
+          Write-Host "Verified $($files.Count) signature(s)."
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.signed-artifact }}
+          path: bin
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention-days }}

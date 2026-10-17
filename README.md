@@ -2,7 +2,7 @@
 
 Centralized Authenticode signing service for iyulab Windows artifacts.
 
-This repository provides **two ways** to sign Windows binaries with the iyulab GlobalSign EV code signing certificate:
+This repository provides **three ways** to sign Windows binaries with the iyulab GlobalSign EV code signing certificate. Whichever you use, pin it to a commit (`iyulab/code-sign@<sha> # <tag>`), not `@main`: the job that runs it holds the signing credential.
 
 ### 1. Composite Action (`iyulab/code-sign@main`) — Recommended for mid-build signing
 
@@ -18,12 +18,14 @@ jobs:
       contents: read
     steps:
       - run: dotnet publish ... -o out
-      - uses: iyulab/code-sign@main
+      - uses: iyulab/code-sign@<sha>
         with:
           files: |
             out/MyApp.exe
             out/MyApp.dll
 ```
+
+The example above signs inside the build job, so the build's own steps and every action it uses run next to the OIDC token. When the build pulls third-party code (package managers, toolchain actions), prefer the reusable workflow below, which keeps the credential in a job that runs nothing but signing.
 
 **Prerequisites for this path:**
 - Caller repo must be granted an Azure AD federated credential whose subject matches the caller's OIDC `sub` claim for the `production` environment — `repo:iyulab/<caller>:environment:production`, or for repositories that use immutable subject claims `repo:iyulab@<org-id>/<caller>@<repo-id>:environment:production`. Check which form a repo emits with `gh api repos/iyulab/<caller>/actions/oidc/customization/sub` before creating the credential.
@@ -70,15 +72,63 @@ with `src-tauri/tauri.sign.conf.json`:
 ```
 
 Notes:
+- **The hook mode widens the signing boundary to the rest of the job.** Once the action has run, every later step of that job can sign any file (`code-sign-file.cmd` is on `PATH` and the Azure session is live). That is the point when a bundler has to sign as it goes, but it means the bundler and everything it runs are trusted with the certificate. In a job that exists only to sign, call the action with `files` and nothing after it — or use the reusable workflow below.
 - A sign hook usually keeps a failing command's output to itself, and some do not fail the build at all (an NSIS uninstaller is signed by `makensis`, which ignores the command's exit code). Always verify the signatures of what you ship, e.g. `Get-AuthenticodeSignature` on the installed files, and print `CODE_SIGN_LOG` when a step fails.
 - The Key Vault token is taken from `az` for every file, so signing works in any later step of the job as long as the Azure CLI session from the action's login is still valid. That session cannot be renewed once its access token expires (roughly an hour after the action runs), so run the action shortly before the steps that sign, not at the start of a long job.
 - Calling the action again in the same job is fine: the settings are exported again and the log keeps growing.
 
-### 2. Dispatch Service (`sign-on-dispatch.yml`) — For batch post-build signing
+### 2. Reusable signing workflow (`sign.yml`) — signing in a job that runs nothing else
+
+The caller builds without any credential and uploads the files to sign as an artifact. `sign.yml` runs in its own job: it downloads that artifact, refuses it unless it holds **exactly** the listed files, signs them with this repository's action (checked out at the same commit as the workflow, `job.workflow_sha`), verifies the signatures and uploads the signed copies as a new artifact. Nothing of the caller's code runs in the job that holds the credential.
+
+```yaml
+jobs:
+  build:                       # no id-token here
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      # ... build, then put exactly the files to sign into one folder ...
+      - uses: actions/upload-artifact@<sha> # <tag>
+        with:
+          name: unsigned-binaries
+          path: to-sign
+
+  sign:
+    needs: build
+    uses: iyulab/code-sign/.github/workflows/sign.yml@<sha> # <tag>
+    permissions:
+      id-token: write
+      contents: read
+    with:
+      artifact: unsigned-binaries
+      files: |                 # relative to the artifact root; must match its contents exactly
+        MyApp.exe
+        runtime/MyApp.Host.exe
+      signed-artifact: signed-binaries
+      description: MyApp
+
+  package:
+    needs: sign                # downloads signed-binaries and continues without the credential
+```
+
+| Input | Required | Purpose |
+|---|---|---|
+| `artifact` | yes | Artifact of the calling run holding the files to sign |
+| `files` | yes | Newline-separated paths relative to the artifact root — the artifact must hold exactly these (no more, no fewer) |
+| `signed-artifact` | yes | Name of the artifact the signed files are uploaded as, in the same layout |
+| `description`, `description-url` | no | Shown in the signature |
+| `retention-days` | no (1) | Retention of the signed artifact |
+
+Prerequisites are the same as for the action (federated credential for the caller's `production` environment, the environment itself); the job declares `environment: production`, and the calling job must grant `id-token: write` and `contents: read`. An installer that a bundler builds from the signed files is signed by calling the workflow a second time on the installer.
+
+**Narrowing the credential to this workflow.** A caller's federated credential normally matches `repo:iyulab/<caller>:environment:production`, which any job of that repository with the `production` environment satisfies. The OIDC token of a job run through this workflow also carries `job_workflow_ref` (`iyulab/code-sign/.github/workflows/sign.yml@<ref>`). To accept only those jobs, include that claim in the caller's subject (`gh api -X PUT repos/iyulab/<caller>/actions/oidc/customization/sub -f use_default=false -f 'include_claim_keys[]=repo' -f 'include_claim_keys[]=context' -f 'include_claim_keys[]=job_workflow_ref'`) and match it in Azure — with an exact subject the credential names one pinned commit and has to be updated on every bump, so a pattern match (Azure's flexible federated identity credentials, `claimsMatchingExpression`) on `…:job_workflow_ref:iyulab/code-sign/.github/workflows/sign.yml@*` is the practical form. Changing the subject breaks that repository's other `production` jobs that sign directly, so move them to the workflow first.
+
+### 3. Dispatch Service (`sign-on-dispatch.yml`) — For batch post-build signing
 
 Send a `repository_dispatch` event with asset names already attached to a draft GitHub Release. The service downloads, signs, and replaces the assets. Useful when the caller doesn't want to modify its build jobs (only its publish step).
 
-The Azure Key Vault credentials never leave this repository. Caller repos do not need their own Azure AD configuration for path (2).
+The Azure Key Vault credentials never leave this repository. Caller repos do not need their own Azure AD configuration for path (3).
 
 ---
 
@@ -89,7 +139,8 @@ The Azure Key Vault credentials never leave this repository. Caller repos do not
   - `repo:iyulab/Filer-releases:environment:production` — for the composite action path
   - Additional credentials added per caller repo as needed
 - Every federated credential requires the caller to declare `environment: production` on the signing job — this is the OIDC claim gate
-- **Composite action path**: no secrets needed on caller side, only the federated credential
+- **Composite action and reusable workflow paths**: no secrets needed on caller side, only the federated credential
+- **Pinned third-party code**: every job here that holds the OIDC token runs `azure/login` pinned to a commit and AzureSignTool pinned to an exact version, installed into the job's own folder (a copy already on the runner is never used). Bump them deliberately, in `action.yml` and `sign-on-dispatch.yml` together.
 - **Dispatch service path**: explicit allowlist in `.github/workflows/sign-on-dispatch.yml` + iyulab org-level `RELEASE_TOKEN` for cross-repo asset access
 - **Payload validation** (dispatch path only): tag format, asset name whitelist, path traversal prevention
 
@@ -256,9 +307,10 @@ Inspect the most recent `sign-on-dispatch.yml` run in this repo for the actual e
 | File | Purpose |
 |---|---|
 | `action.yml` | **Composite action** for in-build signing (`uses: iyulab/code-sign@main`) |
-| `scripts/sign-file.ps1` | Signs one file; used by the action for each of its `files` and by `code-sign-file.cmd` |
+| `scripts/sign-file.ps1` | Signs one file with the AzureSignTool the action installed; used by the action for each of its `files` and by `code-sign-file.cmd` |
+| `.github/workflows/sign.yml` | Reusable signing workflow (`workflow_call`) — signs a fixed list of files from an artifact in a job that runs nothing else |
 | `.github/workflows/sign-on-dispatch.yml` | Dispatch service workflow (repository_dispatch handler) |
-| `.github/workflows/_sign-test.yml` | Standalone signing smoke test (workflow_dispatch) |
+| `.github/workflows/_sign-test.yml` | Signing smoke test of the action and the reusable workflow (workflow_dispatch) |
 | `.github/workflows/_self-test.yml` | E2E self-test of the dispatch handler (workflow_dispatch) |
 
 The two `_*.yml` workflows are diagnostic tools and are not triggered automatically. They are safe to run manually to validate the signing infrastructure or debug issues.

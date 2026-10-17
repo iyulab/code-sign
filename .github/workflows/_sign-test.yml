@@ -1,27 +1,30 @@
 name: _Sign Test (standalone)
 
-# Smoke test of the composite action in this repository: builds a tiny .NET hello-world, signs its DLL
-# through the action's `files` input and its exe the way a build tool's sign hook would (by running
-# code-sign-file.cmd in a later step), then verifies both signatures. Validates the OIDC + Key Vault path
-# and the per-file entry point in isolation.
+# Smoke test of this repository's two signing paths, each on a tiny .NET hello-world:
+#   sign      — the composite action: signs the DLL through the `files` input and the exe the way a build
+#               tool's sign hook would (code-sign-file.cmd in a later step), then verifies both.
+#   reusable  — the layer-2 workflow (sign.yml): an unsigned artifact built in a job with no credential,
+#               signed by the reusable workflow, verified in a third job that again holds no credential.
+# Validates the OIDC + Key Vault path, the per-file entry point and the reusable workflow in isolation.
 
 on:
   workflow_dispatch:
 
-permissions:
-  id-token: write
-  contents: read
+permissions: {}
 
 jobs:
   sign:
     runs-on: windows-latest
     environment: production
     timeout-minutes: 15
+    permissions:
+      id-token: write
+      contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@v6
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
         with:
           dotnet-version: '8.0.x'
 
@@ -77,10 +80,67 @@ jobs:
           if ($logged.Count -ne 2) { throw "expected 2 signed entries in the sign log, found $($logged.Count)" }
 
       - name: Upload signed files (for inspection)
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: signed-dummy
           path: |
             work/out/DummyApp.exe
             work/out/DummyApp.dll
           retention-days: 1
+
+  reusable-build:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    permissions: {}
+    steps:
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build dummy exe
+        shell: pwsh
+        run: |
+          dotnet new console -n DummyApp -o work --force
+          dotnet publish work/DummyApp.csproj -c Release -r win-x64 --self-contained false -o out
+          New-Item -ItemType Directory -Path unsigned/lib -Force | Out-Null
+          Copy-Item out/DummyApp.exe unsigned/
+          Copy-Item out/DummyApp.dll unsigned/lib/
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unsigned
+          path: unsigned
+          if-no-files-found: error
+          retention-days: 1
+
+  reusable-sign:
+    needs: reusable-build
+    uses: ./.github/workflows/sign.yml
+    permissions:
+      id-token: write
+      contents: read
+    with:
+      artifact: unsigned
+      files: |
+        DummyApp.exe
+        lib/DummyApp.dll
+      signed-artifact: signed
+      description: DummyApp
+
+  reusable-check:
+    needs: reusable-sign
+    runs-on: windows-latest
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: signed
+          path: signed
+
+      - name: Verify signatures outside the signing job
+        shell: pwsh
+        run: |
+          $bad = Get-ChildItem signed -Recurse -File | Where-Object { (Get-AuthenticodeSignature $_.FullName).Status -ne 'Valid' }
+          if ($bad) { throw "Missing or invalid signature: $($bad.Name -join ', ')" }
+          Get-ChildItem signed -Recurse -File | ForEach-Object { "$($_.Name): $((Get-AuthenticodeSignature $_.FullName).SignerCertificate.Subject)" }
