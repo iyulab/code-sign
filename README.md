@@ -122,7 +122,22 @@ jobs:
 
 Prerequisites are the same as for the action (federated credential for the caller's `production` environment, the environment itself); the job declares `environment: production`, and the calling job must grant `id-token: write` and `contents: read`. An installer that a bundler builds from the signed files is signed by calling the workflow a second time on the installer.
 
-**Narrowing the credential to this workflow.** A caller's federated credential normally matches `repo:iyulab/<caller>:environment:production`, which any job of that repository with the `production` environment satisfies. The OIDC token of a job run through this workflow also carries `job_workflow_ref` (`iyulab/code-sign/.github/workflows/sign.yml@<ref>`). To accept only those jobs, include that claim in the caller's subject (`gh api -X PUT repos/iyulab/<caller>/actions/oidc/customization/sub -f use_default=false -f 'include_claim_keys[]=repo' -f 'include_claim_keys[]=context' -f 'include_claim_keys[]=job_workflow_ref'`) and match it in Azure — with an exact subject the credential names one pinned commit and has to be updated on every bump, so a pattern match (Azure's flexible federated identity credentials, `claimsMatchingExpression`) on `…:job_workflow_ref:iyulab/code-sign/.github/workflows/sign.yml@*` is the practical form. Changing the subject breaks that repository's other `production` jobs that sign directly, so move them to the workflow first.
+**Narrowing the credential to this workflow.** A caller's federated credential normally matches `repo:iyulab/<caller>:environment:production`, which any job of that repository with the `production` environment satisfies. The OIDC token of a job run through this workflow also carries `job_workflow_ref` (`iyulab/code-sign/.github/workflows/sign.yml@<ref>`). To accept only those jobs, match that claim in Azure. With an exact match the credential names one pinned commit and has to be updated on every bump, so use a pattern match on `iyulab/code-sign/.github/workflows/sign.yml@*`. There are two ways to do it:
+
+1. **As its own claim (preferred).** A [flexible federated identity credential](https://learn.microsoft.com/entra/workload-id/workload-identities-flexible-federated-identity-credentials) (preview) can match `job_workflow_ref` next to `sub`, so the caller's OIDC subject template stays as it is and none of its other jobs is affected:
+
+   ```
+   claims['sub'] eq '<the caller's current environment:production subject>'
+     and claims['job_workflow_ref'] matches 'iyulab/code-sign/.github/workflows/sign.yml@*'
+     and claims['repository_id'] eq '<repository id>'
+     and claims['repository_owner_id'] eq '<owner id>'
+   ```
+
+   For GitHub-issued tokens the platform requires `sub` plus at least one of `repository_id` and `repository_owner_id`; matching both is the stricter form. To switch over without a gap, add the new credential first, delete the old exact-subject credential, then run a signing job — recreating the old credential is the rollback.
+
+2. **Inside the subject.** Include the claim in the caller's subject (`gh api -X PUT repos/iyulab/<caller>/actions/oidc/customization/sub -f use_default=false -f 'include_claim_keys[]=repo' -f 'include_claim_keys[]=context' -f 'include_claim_keys[]=job_workflow_ref'`) and match `…:job_workflow_ref:iyulab/code-sign/.github/workflows/sign.yml@*` in `sub` with a flexible credential that also carries a `repository_id` and/or `repository_owner_id` clause. Changing the subject breaks that repository's other `production` jobs that sign directly, so move them to the workflow first, and mind the ordering of the two changes.
+
+Whichever form a credential uses, check that it still carries an id clause: a flexible credential for GitHub without `repository_id` / `repository_owner_id` does not meet the current rules.
 
 ### 3. Dispatch Service (`sign-on-dispatch.yml`) — For batch post-build signing
 
