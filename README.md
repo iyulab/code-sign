@@ -1,8 +1,8 @@
 # iyulab/code-sign
 
-Centralized Authenticode signing service for iyulab Windows artifacts.
+Centralized code signing service for iyulab artifacts: Authenticode for Windows, and an entry to the organization's signing Mac for macOS.
 
-This repository provides **three ways** to sign Windows binaries with the iyulab GlobalSign EV code signing certificate. Whichever you use, pin it to a commit (`iyulab/code-sign@<sha> # <tag>`), not `@main`: the job that runs it holds the signing credential.
+This repository provides **three ways** to sign Windows binaries with the iyulab GlobalSign EV code signing certificate, and a reusable entry for macOS bundles (see "macOS entry" below). Whichever you use, pin it to a commit (`iyulab/code-sign@<sha> # <tag>`), not `@main`: the job that runs it holds the signing credential.
 
 ### 1. Composite Action (`iyulab/code-sign@main`) — Recommended for mid-build signing
 
@@ -138,6 +138,29 @@ Prerequisites are the same as for the action (federated credential for the calle
 2. **Inside the subject.** Include the claim in the caller's subject (`gh api -X PUT repos/iyulab/<caller>/actions/oidc/customization/sub -f use_default=false -f 'include_claim_keys[]=repo' -f 'include_claim_keys[]=context' -f 'include_claim_keys[]=job_workflow_ref'`) and match `…:job_workflow_ref:iyulab/code-sign/.github/workflows/sign.yml@*` in `sub` with a flexible credential that also carries a `repository_id` and/or `repository_owner_id` clause. Changing the subject breaks that repository's other `production` jobs that sign directly, so move them to the workflow first, and mind the ordering of the two changes.
 
 Whichever form a credential uses, check that it still carries an id clause: a flexible credential for GitHub without `repository_id` / `repository_owner_id` does not meet the current rules.
+
+### macOS entry (`sign-macos.yml`) — signing on the organization's Mac
+
+The macOS counterpart of `sign.yml`, with the same shape: the caller builds the bundle without any credential and uploads it as an artifact (`<App>.app.tar` plus an `entitlements/` folder), then calls the workflow. It signs nothing itself and holds no signing credential. It starts a signing workflow in a private repository (the Mac runner is self-hosted, which GitHub allows only for private repositories), waits for it and fails unless that run concluded `success`. The Mac signs the bundle with a Developer ID, notarizes it, builds the disk image and the update archive, checks them and attaches them to the draft release `v<version>` of the calling repository.
+
+```yaml
+jobs:
+  macos-build:                 # the caller's own: build the bundle, no credential
+    # ... uploads artifact `macos-bundle`
+  macos-sign:
+    needs: [release, macos-build]   # after the draft release exists
+    uses: iyulab/code-sign/.github/workflows/sign-macos.yml@<sha> # <tag>
+    secrets: inherit           # RELEASE_BOT_PRIVATE_KEY
+    with:
+      version: ${{ needs.macos-build.outputs.version }}
+```
+
+| Input | Required | Purpose |
+|---|---|---|
+| `version` | yes | Release version without the `v`; the draft release is `v<version>` |
+| `artifact` | no (`macos-bundle`) | Artifact of the calling run holding `<App>.app.tar` and `entitlements/` |
+
+Organization settings, once for all apps: the variables `RELEASE_BOT_CLIENT_ID` and `MACOS_SIGN_REPO` (the private signing repository, `owner/name`), the secret `RELEASE_BOT_PRIVATE_KEY`, and the release bot's GitHub App installed on the signing repository (Actions: write) and on every calling repository (Contents: write, Actions: read). The token the workflow mints is limited to Actions and metadata on the signing repository. Admitting a new app is a one-line allow-list entry in the signing repository; nothing changes here.
 
 ### 3. Dispatch Service (`sign-on-dispatch.yml`) — For batch post-build signing
 
@@ -324,6 +347,7 @@ Inspect the most recent `sign-on-dispatch.yml` run in this repo for the actual e
 | `action.yml` | **Composite action** for in-build signing (`uses: iyulab/code-sign@main`) |
 | `scripts/sign-file.ps1` | Signs one file with the AzureSignTool the action installed; used by the action for each of its `files` and by `code-sign-file.cmd` |
 | `.github/workflows/sign.yml` | Reusable signing workflow (`workflow_call`) — signs a fixed list of files from an artifact in a job that runs nothing else |
+| `.github/workflows/sign-macos.yml` | macOS entry (`workflow_call`) — hands a credential-free bundle to the private signing repository and waits for it; holds no signing credential |
 | `.github/workflows/sign-on-dispatch.yml` | Dispatch service workflow (repository_dispatch handler) |
 | `.github/workflows/_sign-test.yml` | Signing smoke test of the action and the reusable workflow (workflow_dispatch) |
 | `.github/workflows/_self-test.yml` | E2E self-test of the dispatch handler (workflow_dispatch) |

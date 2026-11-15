@@ -1,0 +1,102 @@
+name: Sign macOS (reusable)
+
+# macOS entry, the sibling of sign.yml. A caller builds its macOS bundle without any credential, uploads it as an
+# artifact and calls this workflow. The signing happens on a registered Mac, in a workflow of a private repository: this
+# job only starts that workflow, waits for it and fails unless it concluded `success`. The Mac signs the bundle with a
+# Developer ID, notarizes it, makes the disk image and the update archive, checks them and attaches them to the draft
+# release `v<version>` of the calling repository. Nothing in this file holds a signing credential or runs on the Mac.
+#
+# Why the Mac job is not in this repository: a self-hosted runner is allowed only for private repositories, and this one
+# is public. An app is admitted on the private side with a one-line allow-list entry; here it only needs a job that calls
+# this workflow.
+#
+#   jobs:
+#     macos-build:                       # the caller's own: build the bundle, no credential
+#       ...                              # uploads artifact `macos-bundle` = `<App>.app.tar` + `entitlements/`
+#     macos-sign:
+#       needs: [release, macos-build]    # after the draft release exists
+#       uses: iyulab/code-sign/.github/workflows/sign-macos.yml@<sha> # <tag>
+#       secrets: inherit                 # RELEASE_BOT_PRIVATE_KEY (organization secret)
+#       with:
+#         version: ${{ needs.macos-build.outputs.version }}
+#
+# Organization settings this needs, once for all apps: the variables RELEASE_BOT_CLIENT_ID and MACOS_SIGN_REPO (the
+# private signing repository, owner/name) and the secret RELEASE_BOT_PRIVATE_KEY, plus the release bot's GitHub App
+# installed on the signing repository (Actions: write) and on every calling repository (Contents: write, Actions: read).
+# The token minted here is limited to Actions and metadata on the signing repository.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: The release version, e.g. 0.15.0 — the draft release is `v<version>`.
+        required: true
+        type: string
+      artifact:
+        description: Artifact (from the calling run) holding `<App>.app.tar` and `entitlements/`.
+        required: false
+        type: string
+        default: macos-bundle
+    secrets:
+      RELEASE_BOT_PRIVATE_KEY:
+        required: true
+
+permissions: {}
+
+jobs:
+  sign:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions: {}
+    steps:
+      - id: sign
+        name: Name the signing repository
+        env:
+          SIGN_REPO: ${{ vars.MACOS_SIGN_REPO }}
+        run: |
+          [ -n "$SIGN_REPO" ] || { echo 'the organization variable MACOS_SIGN_REPO is not set' >&2; exit 1; }
+          echo "name=${SIGN_REPO#*/}" >> "$GITHUB_OUTPUT"
+
+      - id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.RELEASE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ steps.sign.outputs.name }}
+          permission-actions: write
+          permission-metadata: read
+
+      - name: Start the signing workflow and wait for it
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          SIGN_REPO: ${{ vars.MACOS_SIGN_REPO }}
+          RELEASES_REPO: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+          ARTIFACT: ${{ inputs.artifact }}
+        run: |
+          [ -n "$SIGN_REPO" ] || { echo 'the organization variable MACOS_SIGN_REPO is not set' >&2; exit 1; }
+          # The REST API only: `gh run list` / `gh run watch` resolve the default branch through GraphQL, which a token limited
+          # to Actions and metadata is not allowed to read.
+          latest() {
+            gh api "repos/$SIGN_REPO/actions/workflows/macos-sign.yml/runs?event=workflow_dispatch&per_page=1" --jq '.workflow_runs[0].id // 0'
+          }
+          before=$(latest)
+          gh api -X POST "repos/$SIGN_REPO/actions/workflows/macos-sign.yml/dispatches" -f ref=main \
+            -f "inputs[releases-repo]=$RELEASES_REPO" -f "inputs[run-id]=$GITHUB_RUN_ID" -f "inputs[artifact]=$ARTIFACT" -f "inputs[version]=$VERSION"
+          id=''
+          for _ in $(seq 1 30); do
+            sleep 5
+            now=$(latest)
+            if [ "$now" != "$before" ]; then id=$now; break; fi
+          done
+          [ -n "$id" ] || { echo 'the signing run did not start' >&2; exit 1; }
+          echo "signing run $id"
+          # Wait for it (the signing Mac queues runs one at a time; a release needs that Mac on).
+          for _ in $(seq 1 170); do
+            read -r run_status run_conclusion < <(gh api "repos/$SIGN_REPO/actions/runs/$id" --jq '[.status, (.conclusion // "-")] | @tsv')
+            [ "$run_status" = completed ] && break
+            sleep 30
+          done
+          echo "signing run $id: $run_status / $run_conclusion"
+          [ "$run_status" = completed ] && [ "$run_conclusion" = success ]
